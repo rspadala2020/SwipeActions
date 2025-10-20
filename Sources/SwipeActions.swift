@@ -120,7 +120,7 @@ public struct SwipeOptions {
     var swipeEnabled = true
 
     /// The minimum distance needed to drag to start the gesture. Should be more than 0 for best compatibility with other gestures/buttons.
-    var swipeMinimumDistance = Double(2)
+    var swipeMinimumDistance = Double(30)
 
     /// The style to use (`mask`, `equalWidths`, or `cascade`).
     var actionsStyle = SwipeActionStyle.mask
@@ -440,7 +440,7 @@ public struct SwipeView<Label, LeadingActions, TrailingActions>: View where Labe
         // MARK: - Add gestures
 
         .highPriorityGesture( /// Add the drag gesture.
-            DragGesture(minimumDistance: options.swipeMinimumDistance)
+            DragGesture(minimumDistance: options.swipeMinimumDistance, coordinateSpace: .local)
                 .updating($currentlyDragging) { value, state, transaction in
                     state = true
                 }
