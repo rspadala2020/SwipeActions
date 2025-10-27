@@ -30,6 +30,7 @@
  */
 
 import SwiftUI
+import Combine
 
 // MARK: - Structures
 
@@ -120,7 +121,7 @@ public struct SwipeOptions {
     var swipeEnabled = true
 
     /// The minimum distance needed to drag to start the gesture. Should be more than 0 for best compatibility with other gestures/buttons.
-    var swipeMinimumDistance = Double(10)
+    var swipeMinimumDistance = Double(2)
 
     /// The style to use (`mask`, `equalWidths`, or `cascade`).
     var actionsStyle = SwipeActionStyle.mask
@@ -334,65 +335,65 @@ public struct SwipeAction<Label: View, Background: View>: View {
 /// A view for adding swipe actions.
 public struct SwipeView<Label, LeadingActions, TrailingActions>: View where Label: View, LeadingActions: View, TrailingActions: View {
     // MARK: - Properties
-
+    
     /// Options for configuring the swipe view.
     public var options = SwipeOptions()
-
+    @ObservedObject var sharedData = SwipeActionSharedData.shared
     @ViewBuilder public var label: () -> Label
     @ViewBuilder public var leadingActions: (SwipeContext) -> LeadingActions
     @ViewBuilder public var trailingActions: (SwipeContext) -> TrailingActions
-
+    
     // MARK: - Environment
-
+    
     /// Read the `swipeViewGroupSelection` from the parent `SwipeViewGroup` (if it exists).
     @Environment(\.swipeViewGroupSelection) var swipeViewGroupSelection
-
+    
     // MARK: - Internal state
-
+    
     /// The ID of the view. Set `options.id` to override this.
     @State var id = UUID()
-
+    
     /// The size of the parent view.
     @State var size = CGSize.zero
-
+    
     // MARK: - Actions state
-
+    
     /// The current side that's showing the actions.
     @State var currentSide: SwipeSide?
-
+    
     /// The `closed/expanded/triggering/triggered/none` state for the leading side.
     @State var leadingState: SwipeState?
-
+    
     /// The `closed/expanded/triggering/triggered/none` state for the trailing side.
     @State var trailingState: SwipeState?
-
+    
     /// These properties are set automatically via `SwipeActionsLayout`.
     @State var numberOfLeadingActions = 0
     @State var numberOfTrailingActions = 0
-
+    
     /// Enable triggering the leading edge via a drag.
     @State var swipeToTriggerLeadingEdge = false
-
+    
     /// Enable triggering the trailing edge via a drag.
     @State var swipeToTriggerTrailingEdge = false
-
+    
     // MARK: - Gesture state
-
+    
     /// When you touch down with a second finger, the drag gesture freezes, but `currentlyDragging` will be accurate.
     @GestureState var currentlyDragging = false
-
+    
     /// Upon a gesture freeze / cancellation, use this to end the gesture.
     @State var latestDragGestureValueBackup: DragGesture.Value?
-
+    
     /// The gesture's current velocity.
     @GestureVelocity var velocity: CGVector
-
+    
     /// The offset dragged in the current drag session.
     @State var currentOffset = Double(0)
-
+    
     /// The offset dragged in previous drag sessions.
     @State var savedOffset = Double(0)
-
+    
     /// A view for adding swipe actions.
     public init(
         @ViewBuilder label: @escaping () -> Label,
@@ -403,117 +404,257 @@ public struct SwipeView<Label, LeadingActions, TrailingActions>: View where Labe
         self.leadingActions = leadingActions
         self.trailingActions = trailingActions
     }
-
+    
     public var body: some View {
-        HStack {
-            label()
-                .offset(x: offset) /// Apply the offset here.
-        }
-        .readSize { size = $0 } /// Read the size of the parent label.
-        .background( /// Leading swipe actions.
-            actionsView(side: .leading, state: $leadingState, numberOfActions: $numberOfLeadingActions) { context in
-                leadingActions(context)
-                    .environment(\.swipeContext, context)
-                    .onPreferenceChange(AllowSwipeToTriggerKey.self) { allow in
-
-                        /// Unwrap the value first (if it's not the edge action, `allow` is `nil`).
-                        if let allow {
-                            swipeToTriggerLeadingEdge = allow
+        Group {
+            if #available(iOS 18, *) {
+                HStack {
+                    label()
+                        .offset(x: offset) /// Apply the offset here.
+                }
+                .readSize { size = $0 } /// Read the size of the parent label.
+                .background( /// Leading swipe actions.
+                    actionsView(side: .leading, state: $leadingState, numberOfActions: $numberOfLeadingActions) { context in
+                        leadingActions(context)
+                            .environment(\.swipeContext, context)
+                            .onPreferenceChange(AllowSwipeToTriggerKey.self) { allow in
+                                
+                                /// Unwrap the value first (if it's not the edge action, `allow` is `nil`).
+                                if let allow {
+                                    swipeToTriggerLeadingEdge = allow
+                                }
+                            }
+                    },
+                    alignment: .leading
+                )
+                .background( /// Trailing swipe actions.
+                    actionsView(side: .trailing, state: $trailingState, numberOfActions: $numberOfTrailingActions) { context in
+                        trailingActions(context)
+                            .environment(\.swipeContext, context)
+                            .onPreferenceChange(AllowSwipeToTriggerKey.self) { allow in
+                                if let allow {
+                                    swipeToTriggerTrailingEdge = allow
+                                }
+                            }
+                    },
+                    alignment: .trailing
+                )
+                
+                // MARK: - Add gestures
+                
+                .gesture(
+                    PanGesture(onBegan: gestureDidBegan,
+                               onChange: gestureDidChange, onEnded: gestureOnEnded)
+                    
+                )
+                .onChange(of: currentlyDragging) { currentlyDragging in /// Detect gesture cancellations.
+                    if !currentlyDragging, let latestDragGestureValueBackup {
+                        /// Gesture cancelled.
+                        let velocity = velocity.dx / currentOffset
+                        end(value: latestDragGestureValueBackup, translation: latestDragGestureValueBackup.translation, velocity: velocity)
+                    }
+                }
+                
+                // MARK: - Trigger haptics
+                
+                .onChange(of: leadingState) { [leadingState] newValue in
+                    /// Make sure the change was from `triggering` to `nil`, or the other way around.
+                    let changed =
+                    leadingState == .triggering && newValue == nil ||
+                    leadingState == nil && newValue == .triggering
+                    
+                    if changed, options.enableTriggerHaptics { /// Generate haptic feedback if necessary.
+                        let generator = UIImpactFeedbackGenerator(style: .rigid)
+                        generator.impactOccurred()
+                    }
+                }
+                .onChange(of: trailingState) { [trailingState] newValue in
+                    
+                    let changed =
+                    trailingState == .triggering && newValue == nil ||
+                    trailingState == nil && newValue == .triggering
+                    
+                    if changed, options.enableTriggerHaptics {
+                        let generator = UIImpactFeedbackGenerator(style: .rigid)
+                        generator.impactOccurred()
+                    }
+                }
+                
+                // MARK: - Receive `SwipeViewGroup` events
+                
+                .onChange(of: currentlyDragging) { newValue in
+                    if newValue {
+                        swipeViewGroupSelection.wrappedValue = id
+                    }
+                }
+                .onChange(of: leadingState) { newValue in
+                    if newValue == .closed, swipeViewGroupSelection.wrappedValue == id {
+                        swipeViewGroupSelection.wrappedValue = nil
+                    }
+                }
+                .onChange(of: trailingState) { newValue in
+                    if newValue == .closed, swipeViewGroupSelection.wrappedValue == id {
+                        swipeViewGroupSelection.wrappedValue = nil
+                    }
+                }
+                .onChange(of: swipeViewGroupSelection.wrappedValue) { newValue in
+                    if swipeViewGroupSelection.wrappedValue != id {
+                        currentSide = nil
+                        
+                        if leadingState != .closed {
+                            leadingState = .closed
+                            close(velocity: 0)
+                        }
+                        
+                        if trailingState != .closed {
+                            trailingState = .closed
+                            close(velocity: 0)
                         }
                     }
-            },
-            alignment: .leading
-        )
-        .background( /// Trailing swipe actions.
-            actionsView(side: .trailing, state: $trailingState, numberOfActions: $numberOfTrailingActions) { context in
-                trailingActions(context)
-                    .environment(\.swipeContext, context)
-                    .onPreferenceChange(AllowSwipeToTriggerKey.self) { allow in
-                        if let allow {
-                            swipeToTriggerTrailingEdge = allow
+                }
+            } else {
+                HStack {
+                    label()
+                        .offset(x: offset) /// Apply the offset here.
+                }
+                .readSize { size = $0 } /// Read the size of the parent label.
+                .background( /// Leading swipe actions.
+                    actionsView(side: .leading, state: $leadingState, numberOfActions: $numberOfLeadingActions) { context in
+                        leadingActions(context)
+                            .environment(\.swipeContext, context)
+                            .onPreferenceChange(AllowSwipeToTriggerKey.self) { allow in
+                                
+                                /// Unwrap the value first (if it's not the edge action, `allow` is `nil`).
+                                if let allow {
+                                    swipeToTriggerLeadingEdge = allow
+                                }
+                            }
+                    },
+                    alignment: .leading
+                )
+                .background( /// Trailing swipe actions.
+                    actionsView(side: .trailing, state: $trailingState, numberOfActions: $numberOfTrailingActions) { context in
+                        trailingActions(context)
+                            .environment(\.swipeContext, context)
+                            .onPreferenceChange(AllowSwipeToTriggerKey.self) { allow in
+                                if let allow {
+                                    swipeToTriggerTrailingEdge = allow
+                                }
+                            }
+                    },
+                    alignment: .trailing
+                )
+                
+                // MARK: - Add gestures
+                
+                .highPriorityGesture( /// Add the drag gesture.
+                    DragGesture(minimumDistance: options.swipeMinimumDistance)
+                        .updating($currentlyDragging) { value, state, transaction in
+                            state = true
+                        }
+                        .onChanged(onChanged)
+                        .onEnded(onEnded)
+                        .updatingVelocity($velocity),
+                    including: options.swipeEnabled ? .all : .subviews /// Enable/disable swiping here.
+                )
+                .onChange(of: currentlyDragging) { currentlyDragging in /// Detect gesture cancellations.
+                    if !currentlyDragging, let latestDragGestureValueBackup {
+                        /// Gesture cancelled.
+                        let velocity = velocity.dx / currentOffset
+                        end(value: latestDragGestureValueBackup, translation: latestDragGestureValueBackup.translation, velocity: velocity)
+                    }
+                }
+                
+                // MARK: - Trigger haptics
+                
+                .onChange(of: leadingState) { [leadingState] newValue in
+                    /// Make sure the change was from `triggering` to `nil`, or the other way around.
+                    let changed =
+                    leadingState == .triggering && newValue == nil ||
+                    leadingState == nil && newValue == .triggering
+                    
+                    if changed, options.enableTriggerHaptics { /// Generate haptic feedback if necessary.
+                        let generator = UIImpactFeedbackGenerator(style: .rigid)
+                        generator.impactOccurred()
+                    }
+                }
+                .onChange(of: trailingState) { [trailingState] newValue in
+                    
+                    let changed =
+                    trailingState == .triggering && newValue == nil ||
+                    trailingState == nil && newValue == .triggering
+                    
+                    if changed, options.enableTriggerHaptics {
+                        let generator = UIImpactFeedbackGenerator(style: .rigid)
+                        generator.impactOccurred()
+                    }
+                }
+                
+                // MARK: - Receive `SwipeViewGroup` events
+                
+                .onChange(of: currentlyDragging) { newValue in
+                    if newValue {
+                        swipeViewGroupSelection.wrappedValue = id
+                    }
+                }
+                .onChange(of: leadingState) { newValue in
+                    if newValue == .closed, swipeViewGroupSelection.wrappedValue == id {
+                        swipeViewGroupSelection.wrappedValue = nil
+                    }
+                }
+                .onChange(of: trailingState) { newValue in
+                    if newValue == .closed, swipeViewGroupSelection.wrappedValue == id {
+                        swipeViewGroupSelection.wrappedValue = nil
+                    }
+                }
+                .onChange(of: swipeViewGroupSelection.wrappedValue) { newValue in
+                    if swipeViewGroupSelection.wrappedValue != id {
+                        currentSide = nil
+                        
+                        if leadingState != .closed {
+                            leadingState = .closed
+                            close(velocity: 0)
+                        }
+                        
+                        if trailingState != .closed {
+                            trailingState = .closed
+                            close(velocity: 0)
                         }
                     }
-            },
-            alignment: .trailing
-        )
-
-        // MARK: - Add gestures
-
-        .highPriorityGesture( /// Add the drag gesture.
-            DragGesture(minimumDistance: options.swipeMinimumDistance)
-                .updating($currentlyDragging) { value, state, transaction in
-                    state = true
-                }
-                .onChanged(onChanged)
-                .onEnded(onEnded)
-                .updatingVelocity($velocity),
-            including: options.swipeEnabled ? .all : .subviews /// Enable/disable swiping here.
-        )
-        .onChange(of: currentlyDragging) { currentlyDragging in /// Detect gesture cancellations.
-            if !currentlyDragging, let latestDragGestureValueBackup {
-                /// Gesture cancelled.
-                let velocity = velocity.dx / currentOffset
-                end(value: latestDragGestureValueBackup, velocity: velocity)
-            }
-        }
-
-        // MARK: - Trigger haptics
-
-        .onChange(of: leadingState) { [leadingState] newValue in
-            /// Make sure the change was from `triggering` to `nil`, or the other way around.
-            let changed =
-                leadingState == .triggering && newValue == nil ||
-                leadingState == nil && newValue == .triggering
-
-            if changed, options.enableTriggerHaptics { /// Generate haptic feedback if necessary.
-                let generator = UIImpactFeedbackGenerator(style: .rigid)
-                generator.impactOccurred()
-            }
-        }
-        .onChange(of: trailingState) { [trailingState] newValue in
-
-            let changed =
-                trailingState == .triggering && newValue == nil ||
-                trailingState == nil && newValue == .triggering
-
-            if changed, options.enableTriggerHaptics {
-                let generator = UIImpactFeedbackGenerator(style: .rigid)
-                generator.impactOccurred()
-            }
-        }
-
-        // MARK: - Receive `SwipeViewGroup` events
-
-        .onChange(of: currentlyDragging) { newValue in
-            if newValue {
-                swipeViewGroupSelection.wrappedValue = id
-            }
-        }
-        .onChange(of: leadingState) { newValue in
-            if newValue == .closed, swipeViewGroupSelection.wrappedValue == id {
-                swipeViewGroupSelection.wrappedValue = nil
-            }
-        }
-        .onChange(of: trailingState) { newValue in
-            if newValue == .closed, swipeViewGroupSelection.wrappedValue == id {
-                swipeViewGroupSelection.wrappedValue = nil
-            }
-        }
-        .onChange(of: swipeViewGroupSelection.wrappedValue) { newValue in
-            if swipeViewGroupSelection.wrappedValue != id {
-                currentSide = nil
-
-                if leadingState != .closed {
-                    leadingState = .closed
-                    close(velocity: 0)
-                }
-
-                if trailingState != .closed {
-                    trailingState = .closed
-                    close(velocity: 0)
                 }
             }
         }
+    }
+}
+
+@MainActor
+class SwipeActionSharedData: ObservableObject {
+    static let shared = SwipeActionSharedData()
+    
+   @Published var activeSwipeAction: UUID?
+}
+
+extension SwipeView {
+    func gestureDidBegan() {
+        swipeViewGroupSelection.wrappedValue = id
+    }
+    func gestureDidChange(onChange: PanGestureValue) {
+        if currentSide == nil {
+            let dx = onChange.translation.width
+            if dx > 0 {
+                currentSide = .leading
+            } else {
+                currentSide = .trailing
+            }
+        } else {
+            change(translation: onChange.translation)
+        }
+    }
+    func gestureOnEnded(onEnded: PanGestureValue) {
+        
+        let velocity = onEnded.velocity.width / currentOffset
+        latestDragGestureValueBackup = nil
+        end(value: nil, translation: onEnded.translation, velocity: velocity)
     }
 }
 
@@ -867,13 +1008,13 @@ extension SwipeView {
 //                change(value: value)
 //            }
         } else {
-            change(value: value)
+            change(translation: value.translation)
         }
     }
 
-    func change(value: DragGesture.Value) {
+    func change(translation: CGSize) {
         /// The total offset of the swipe view.
-        let totalOffset = savedOffset + value.translation.width
+        let totalOffset = savedOffset + translation.width
 
         /// Get the disallowed side if it exists.
         let disallowedSide = getDisallowedSide(totalOffset: totalOffset)
@@ -896,7 +1037,7 @@ extension SwipeView {
             if totalOffset > leadingReadyToTriggerOffset {
                 setCurrentOffset = true
                 if swipeToTriggerLeadingEdge {
-                    currentOffset = value.translation.width
+                    currentOffset = translation.width
                     leadingState = .triggering
                     trailingState = nil
                 } else {
@@ -912,7 +1053,7 @@ extension SwipeView {
             if totalOffset < trailingReadyToTriggerOffset {
                 setCurrentOffset = true
                 if swipeToTriggerTrailingEdge {
-                    currentOffset = value.translation.width
+                    currentOffset = translation.width
                     trailingState = .triggering
                     leadingState = nil
                 } else {
@@ -927,7 +1068,7 @@ extension SwipeView {
 
             /// If the offset wasn't modified already (due to rubber banding), use `value.translation.width` as the default.
             if !setCurrentOffset {
-                currentOffset = value.translation.width
+                currentOffset = translation.width
                 leadingState = nil
                 trailingState = nil
             }
@@ -937,13 +1078,16 @@ extension SwipeView {
     func onEnded(value: DragGesture.Value) {
         latestDragGestureValueBackup = nil
         let velocity = velocity.dx / currentOffset
-        end(value: value, velocity: velocity)
+        end(value: value, translation: value.translation, velocity: velocity)
     }
 
     /// Represents the end of a gesture.
-    func end(value: DragGesture.Value, velocity: CGFloat) {
-        let totalOffset = savedOffset + value.translation.width
-        let totalPredictedOffset = (savedOffset + value.predictedEndTranslation.width) * 0.5
+    func end(value: DragGesture.Value?, translation: CGSize, velocity: CGFloat) {
+        let totalOffset = savedOffset + translation.width
+        var totalPredictedOffset = (savedOffset + translation.width) * 0.5
+        if let value {
+            totalPredictedOffset = (savedOffset + value.predictedEndTranslation.width) * 0.5
+        }
 
         if getDisallowedSide(totalOffset: totalPredictedOffset) != nil {
             currentSide = nil
